@@ -7,6 +7,8 @@
 use core::net::SocketAddr;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -23,6 +25,8 @@ use axum::{
 };
 use gethostname::gethostname;
 use log::{error, info};
+use serde_json;
+use serde_yaml;
 use structopt::StructOpt;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
@@ -36,7 +40,8 @@ use tonic::{Request, Response, Status};
 use crate::manager::manager_client_new;
 use crate::torchftpb::{
     lighthouse_service_server::{LighthouseService, LighthouseServiceServer},
-    KillRequest, LighthouseHeartbeatRequest, LighthouseHeartbeatResponse, LighthouseQuorumRequest,
+    ConfigData, ConfigEntry, KillRequest, LighthouseConfigFetchRequest, LighthouseConfigFetchResponse,
+    LighthouseHeartbeatRequest, LighthouseHeartbeatResponse, LighthouseQuorumRequest,
     LighthouseQuorumResponse, Quorum, QuorumMember,
 };
 
@@ -55,6 +60,10 @@ struct State {
     // heartbeat information
     // replica_id -> last heartbeat
     heartbeats: HashMap<String, Instant>,
+    
+    // configuration data
+    // namespace -> (key -> value)
+    configs: HashMap<String, HashMap<String, String>>,
 }
 
 pub struct Lighthouse {
@@ -120,6 +129,12 @@ pub struct LighthouseOpt {
         help = "How long to wait for a heartbeat before considering a replica dead."
     )]
     pub heartbeat_timeout_ms: u64,
+
+    #[structopt(
+        long = "config",
+        help = "Path to configuration file (json or yaml)"
+    )]
+    pub config_path: Option<String>,
 }
 
 fn quorum_changed(a: &Vec<QuorumMember>, b: &Vec<QuorumMember>) -> bool {
@@ -260,11 +275,106 @@ fn quorum_compute(
     )
 }
 
+// Load configuration from JSON or YAML file
+fn load_config_file(path: &str) -> Result<HashMap<String, HashMap<String, String>>> {
+    let path = Path::new(path);
+    let content = fs::read_to_string(path)?;
+    
+    let configs = if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+        // Parse JSON
+        let json_value: serde_json::Value = serde_json::from_str(&content)?;
+        parse_config_from_value(&json_value)?
+    } else if path.extension().and_then(|ext| ext.to_str()) == Some("yml") 
+          || path.extension().and_then(|ext| ext.to_str()) == Some("yaml") {
+        // Parse YAML
+        let yaml_value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        parse_config_from_yaml(&yaml_value)?
+    } else {
+        return Err(anyhow!("Unsupported config file format. Use .json, .yml, or .yaml"));
+    };
+    
+    Ok(configs)
+}
+
+// Parse config from serde_json::Value
+fn parse_config_from_value(value: &serde_json::Value) -> Result<HashMap<String, HashMap<String, String>>> {
+    let mut configs = HashMap::new();
+    
+    if let serde_json::Value::Object(obj) = value {
+        for (namespace, ns_value) in obj {
+            let mut namespace_map = HashMap::new();
+            
+            if let serde_json::Value::Object(ns_obj) = ns_value {
+                for (key, val) in ns_obj {
+                    // Convert all values to strings
+                    namespace_map.insert(key.clone(), val.to_string().trim_matches('"').to_string());
+                }
+            } else {
+                return Err(anyhow!("Expected namespace '{}' to be an object", namespace));
+            }
+            
+            configs.insert(namespace.clone(), namespace_map);
+        }
+    } else {
+        return Err(anyhow!("Expected config file to contain a JSON object"));
+    }
+    
+    Ok(configs)
+}
+
+// Parse config from serde_yaml::Value
+fn parse_config_from_yaml(value: &serde_yaml::Value) -> Result<HashMap<String, HashMap<String, String>>> {
+    let mut configs = HashMap::new();
+    
+    if let serde_yaml::Value::Mapping(mapping) = value {
+        for (ns_key, ns_value) in mapping {
+            if let serde_yaml::Value::String(namespace) = ns_key {
+                let mut namespace_map = HashMap::new();
+                
+                if let serde_yaml::Value::Mapping(ns_mapping) = ns_value {
+                    for (key, val) in ns_mapping {
+                        if let (serde_yaml::Value::String(k), serde_yaml::Value::String(v)) = (key, val) {
+                            namespace_map.insert(k.clone(), v.clone());
+                        } else if let serde_yaml::Value::String(k) = key {
+                            // Convert any value to string representation
+                            namespace_map.insert(k.clone(), val.as_str().unwrap_or_default().to_string());
+                        }
+                    }
+                } else {
+                    return Err(anyhow!("Expected namespace '{}' to be a mapping", namespace));
+                }
+                
+                configs.insert(namespace.clone(), namespace_map);
+            }
+        }
+    } else {
+        return Err(anyhow!("Expected config file to contain a YAML mapping"));
+    }
+    
+    Ok(configs)
+}
+
 impl Lighthouse {
     pub async fn new(opt: LighthouseOpt) -> Result<Arc<Self>> {
         let listener = tokio::net::TcpListener::bind(&opt.bind).await?;
 
         let (tx, _) = broadcast::channel(16);
+
+        // Load initial configs from file if specified
+        let configs = if let Some(config_path) = &opt.config_path {
+            match load_config_file(config_path) {
+                Ok(cfg) => {
+                    info!("Loaded configuration from {}", config_path);
+                    cfg
+                }
+                Err(e) => {
+                    error!("Failed to load configuration from {}: {}", config_path, e);
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
 
         Ok(Arc::new(Self {
             state: Mutex::new(State {
@@ -273,6 +383,7 @@ impl Lighthouse {
                 prev_quorum: None,
                 quorum_id: 0,
                 heartbeats: HashMap::new(),
+                configs,
             }),
             opt: opt,
             local_addr: listener.local_addr()?,
@@ -541,6 +652,85 @@ impl LighthouseService for Arc<Lighthouse> {
         }
 
         let reply = LighthouseHeartbeatResponse {};
+        Ok(Response::new(reply))
+    }
+    
+    async fn fetch_config(
+        &self,
+        request: Request<LighthouseConfigFetchRequest>,
+    ) -> Result<Response<LighthouseConfigFetchResponse>, Status> {
+        let req = request.into_inner();
+        let replica_id = req.replica_id;
+        let namespace = req.namespace;
+        let keys = req.keys;
+        
+        info!(
+            "Received config fetch request from replica {}, namespace: {}",
+            replica_id,
+            if namespace.is_empty() { "*" } else { &namespace }
+        );
+        
+        // Register heartbeat
+        {
+            let mut state = self.state.lock().await;
+            state.heartbeats.insert(replica_id, Instant::now());
+        }
+        
+        // Get configs
+        let configs = {
+            let state = self.state.lock().await;
+            let mut result = Vec::new();
+            
+            // If namespace is empty, return all configs
+            if namespace.is_empty() {
+                for (ns, config_map) in &state.configs {
+                    let mut entries = Vec::new();
+                    for (key, value) in config_map {
+                        if keys.is_empty() || keys.contains(key) {
+                            entries.push(ConfigEntry {
+                                key: key.clone(),
+                                value: value.clone(),
+                            });
+                        }
+                    }
+                    
+                    if !entries.is_empty() {
+                        result.push(ConfigData {
+                            namespace: ns.clone(),
+                            entries,
+                            updated: Some(SystemTime::now().into()),
+                        });
+                    }
+                }
+            } else if let Some(config_map) = state.configs.get(&namespace) {
+                let mut entries = Vec::new();
+                for (key, value) in config_map {
+                    if keys.is_empty() || keys.contains(key) {
+                        entries.push(ConfigEntry {
+                            key: key.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                }
+                
+                if !entries.is_empty() {
+                    result.push(ConfigData {
+                        namespace: namespace.clone(),
+                        entries,
+                        updated: Some(SystemTime::now().into()),
+                    });
+                }
+            }
+            
+            result
+        };
+        
+        let reply = LighthouseConfigFetchResponse {
+            configs,
+            success: true,
+            error_message: None,
+        };
+        
         Ok(Response::new(reply))
     }
 }

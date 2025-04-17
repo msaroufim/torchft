@@ -34,12 +34,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, TypeVar, cast
+import json
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, TypeVar, Union, cast
 
 import torch
 from torch.distributed import ReduceOp, TCPStore
 
-from torchft._torchft import ManagerClient, ManagerServer
+from torchft._torchft import LighthouseClient, ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.futures import future_timeout
 
@@ -695,6 +696,59 @@ class Manager:
             the total number of batches committed
         """
         return self._batches_committed
+        
+    def fetch_config(
+        self, 
+        namespace: str = "", 
+        keys: Optional[List[str]] = None
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Fetch configuration from the Lighthouse server.
+        
+        Args:
+            namespace: Optional namespace to filter configs. If empty, fetch all namespaces.
+            keys: Optional list of keys to fetch. If None, fetch all keys.
+            
+        Returns:
+            Dictionary of {namespace: {key: value}} config entries.
+        """
+        if not hasattr(self, "_lighthouse_client"):
+            if not hasattr(self, "_lighthouse_addr") or not self._lighthouse_addr:
+                raise RuntimeError("Lighthouse address not set. Cannot fetch config.")
+                
+            self._lighthouse_client = LighthouseClient(
+                self._lighthouse_addr, 
+                self._connect_timeout.total_seconds()
+            )
+        
+        replica_id = self._replica_id if self._rank == 0 else f"{self._replica_id}-{self._rank}"
+        config_dict = {}
+        
+        # Convert keys to list if provided
+        key_list = [] if keys is None else keys
+        
+        try:
+            # Call the Lighthouse RPC
+            config_data = self._lighthouse_client.fetch_config(
+                replica_id=replica_id,
+                namespace=namespace,
+                keys=key_list,
+            )
+            
+            # Process the result into a dictionary
+            for ns_data in config_data:
+                ns = ns_data.namespace
+                if ns not in config_dict:
+                    config_dict[ns] = {}
+                    
+                for entry in ns_data.entries:
+                    config_dict[ns][entry.key] = entry.value
+                
+        except Exception as e:
+            # Log the error but don't crash
+            self._logger.error(f"Error fetching config from Lighthouse: {e}")
+            
+        return config_dict
 
     def participating_rank(self) -> Optional[int]:
         """

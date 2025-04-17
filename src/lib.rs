@@ -35,7 +35,8 @@ pub mod torchftpb {
 use crate::torchftpb::lighthouse_service_client::LighthouseServiceClient;
 use crate::torchftpb::manager_service_client::ManagerServiceClient;
 use crate::torchftpb::{
-    CheckpointMetadataRequest, LighthouseQuorumRequest, ManagerQuorumRequest, ShouldCommitRequest,
+    CheckpointMetadataRequest, ConfigData, ConfigEntry, LighthouseConfigFetchRequest, 
+    LighthouseQuorumRequest, ManagerQuorumRequest, ShouldCommitRequest,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
@@ -478,6 +479,19 @@ struct LighthouseClient {
     runtime: Runtime,
 }
 
+#[pyclass(get_all, set_all)]
+struct ConfigEntryPy {
+    key: String,
+    value: String,
+}
+
+#[pyclass(get_all, set_all)]
+struct ConfigDataPy {
+    namespace: String,
+    entries: Vec<ConfigEntryPy>,
+    updated: Timestamp,
+}
+
 #[pymethods]
 impl LighthouseClient {
     #[pyo3(signature = (addr, connect_timeout))]
@@ -562,6 +576,75 @@ impl LighthouseClient {
         });
         Ok(convert_quorum(py, &quorum?)?)
     }
+    
+    /// fetch_config retrieves configuration from the Lighthouse server.
+    ///
+    /// Args:
+    ///     replica_id (str): The string ID of the replica requesting the config.
+    ///     namespace (str, optional): Filter configs by namespace. Default: "" (fetch all).
+    ///     keys (List[str], optional): Filter configs by specific keys. Default: [] (fetch all keys).
+    ///     timeout (timedelta, optional): Request timeout. Default: 5 seconds.
+    ///
+    /// Returns:
+    ///     List[ConfigDataPy]: List of configuration data objects by namespace.
+    #[pyo3(signature = (
+        replica_id,
+        namespace = "".to_string(),
+        keys = vec![],
+        timeout = Duration::from_secs(5)
+    ))]
+    fn fetch_config(
+        &self,
+        py: Python<'_>,
+        replica_id: String,
+        namespace: String,
+        keys: Vec<String>,
+        timeout: Duration,
+    ) -> Result<Vec<ConfigDataPy>, StatusError> {
+        let configs: Result<Vec<ConfigData>, StatusError> = py.allow_threads(move || {
+            let mut request = tonic::Request::new(LighthouseConfigFetchRequest {
+                replica_id,
+                namespace,
+                keys,
+            });
+            
+            // Set timeout for the request
+            request.set_timeout(timeout);
+            
+            // Execute the request
+            let response = self.runtime.block_on(self.client.clone().fetch_config(request))?;
+            let resp = response.into_inner();
+            
+            if !resp.success {
+                let error_msg = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
+                return Err(Status::internal(format!("Config fetch failed: {}", error_msg)).into());
+            }
+            
+            Ok(resp.configs)
+        });
+        
+        // Convert ConfigData to ConfigDataPy
+        let result = configs?
+            .into_iter()
+            .map(|config| {
+                let entries = config.entries
+                    .into_iter()
+                    .map(|entry| ConfigEntryPy {
+                        key: entry.key,
+                        value: entry.value,
+                    })
+                    .collect();
+                
+                ConfigDataPy {
+                    namespace: config.namespace,
+                    entries,
+                    updated: Timestamp::from(config.updated.unwrap_or_default()),
+                }
+            })
+            .collect();
+        
+        Ok(result)
+    }
 }
 
 /// LighthouseServer is a GRPC server for the lighthouse service.
@@ -586,7 +669,7 @@ struct LighthouseServer {
 
 #[pymethods]
 impl LighthouseServer {
-    #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None))]
+    #[pyo3(signature = (bind, min_replicas, join_timeout_ms=None, quorum_tick_ms=None, heartbeat_timeout_ms=None, config_path=None))]
     #[new]
     fn new(
         py: Python<'_>,
@@ -595,6 +678,7 @@ impl LighthouseServer {
         join_timeout_ms: Option<u64>,
         quorum_tick_ms: Option<u64>,
         heartbeat_timeout_ms: Option<u64>,
+        config_path: Option<String>,
     ) -> PyResult<Self> {
         let join_timeout_ms = join_timeout_ms.unwrap_or(100);
         let quorum_tick_ms = quorum_tick_ms.unwrap_or(100);
@@ -614,6 +698,7 @@ impl LighthouseServer {
                     join_timeout_ms: join_timeout_ms,
                     quorum_tick_ms: quorum_tick_ms,
                     heartbeat_timeout_ms: heartbeat_timeout_ms,
+                    config_path: config_path,
                 }))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
@@ -720,6 +805,8 @@ fn _torchft(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LighthouseServer>()?;
     m.add_class::<LighthouseClient>()?;
     m.add_class::<QuorumResult>()?;
+    m.add_class::<ConfigEntryPy>()?;
+    m.add_class::<ConfigDataPy>()?;
     m.add_function(wrap_pyfunction!(lighthouse_main, m)?)?;
 
     Ok(())
