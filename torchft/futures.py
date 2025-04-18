@@ -1,4 +1,5 @@
 import asyncio
+import os
 import queue
 import sys
 import threading
@@ -45,13 +46,27 @@ class _TimeoutManager:
     Generally there is a single instance of this class that is used for all
     timeouts. The callbacks should not block otherwise other timeouts may not
     be processed.
+
+    A watchdog thread monitors all timeout handlers to ensure they complete
+    promptly. If a timeout handler is hung (for example if ncclCommAbort hangs),
+    the watchdog will terminate the program.
+    
+    The watchdog timeout can be configured through the TORCHFT_WATCHDOG_TIMEOUT
+    environment variable (in seconds). The default is 30 seconds.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._event_loop_thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_shutdown = threading.Event()
         self._next_timer_id = 0
+        self._active_handlers = threading.Semaphore(0)
+        self._completed_handlers = threading.Semaphore(0)
+        
+        # Get watchdog timeout from environment or use default (30 seconds)
+        self._watchdog_timeout = float(os.environ.get("TORCHFT_WATCHDOG_TIMEOUT", "30.0"))
 
         # This queue is used to delete events on the main thread as cudaEventDestroy
         # can block if the CUDA queue is full.
@@ -60,6 +75,7 @@ class _TimeoutManager:
     def _maybe_start_event_loop(self) -> asyncio.AbstractEventLoop:
         """
         Start the event loop if it has not already been started.
+        Also starts the watchdog thread if not already started.
         """
         with self._lock:
             if self._event_loop is None:
@@ -70,14 +86,67 @@ class _TimeoutManager:
                     name="TimeoutManager",
                 )
                 self._event_loop_thread.start()
+
+                # Start the watchdog thread
+                if self._watchdog_thread is None:
+                    self._watchdog_thread = threading.Thread(
+                        target=self._watchdog_monitor,
+                        daemon=True,
+                        name="TimeoutManagerWatchdog",
+                    )
+                    self._watchdog_thread.start()
             # pyre-fixme[7]: optional
             return self._event_loop
+    
+    def _watchdog_monitor(self) -> None:
+        """
+        Monitors timeout handlers to ensure they complete promptly.
+        If a handler is taking too long, terminates the program.
+        
+        The watchdog timeout can be configured via the TORCHFT_WATCHDOG_TIMEOUT
+        environment variable (in seconds). Default is 30 seconds.
+        """
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        
+        # Log the watchdog startup and timeout value
+        logger.debug(f"TimeoutManager watchdog started with timeout={self._watchdog_timeout}s")
+        
+        while not self._watchdog_shutdown.is_set():
+            # Wait for an active handler
+            if not self._active_handlers.acquire(timeout=1.0):
+                continue
+                
+            # Wait for handler completion with timeout
+            if not self._completed_handlers.acquire(timeout=self._watchdog_timeout):
+                # Handler is hung, terminate the program
+                logger.critical(
+                    f"Watchdog detected hung timeout handler after {self._watchdog_timeout}s. "
+                    f"This is likely due to a hung ncclCommAbort call. Terminating process."
+                )
+                
+                # Force exit the process
+                os._exit(1)
+            
+            # Handler completed in time
+            continue
 
     def shutdown(self) -> None:
         """
-        Shutdown the event loop and cancel all pending timeouts.
+        Shutdown the event loop, watchdog thread, and cancel all pending timeouts.
         """
         with self._lock:
+            # Shutdown watchdog thread
+            if self._watchdog_thread is not None:
+                self._watchdog_shutdown.set()
+                # Release any waiting semaphores to unblock the watchdog
+                self._active_handlers.release()
+                self._completed_handlers.release()
+                self._watchdog_thread.join(timeout=5.0)  # Give watchdog 5s to exit
+                self._watchdog_thread = None
+            
+            # Shutdown event loop thread
             if self._event_loop is not None:
                 self._event_loop.call_soon_threadsafe(self._event_loop.stop)
                 assert self._event_loop_thread is not None
@@ -101,14 +170,15 @@ class _TimeoutManager:
         timed_fut: Future[T] = Future()
         handle: _TimerHandle = _TimerHandle()
         loop.call_soon_threadsafe(
-            self._register_callback,
-            loop,
-            lambda: timed_fut.set_exception(
-                # pyre-fixme[6]: e is not T
-                TimeoutError(f"future did not complete within {timeout}")
-            ),
-            timeout,
-            handle,
+            lambda: self._register_callback(
+                loop,
+                lambda: timed_fut.set_exception(
+                    # pyre-fixme[6]: e is not T
+                    TimeoutError(f"future did not complete within {timeout}")
+                ),
+                timeout,
+                handle,
+            )
         )
 
         def callback(fut: Future[T]) -> None:
@@ -144,20 +214,32 @@ class _TimeoutManager:
             self._del_queue.put(event)
 
         loop.call_soon_threadsafe(
-            self._register_callback, loop, handler, timeout, _TimerHandle()
+            lambda: self._register_callback(loop, handler, timeout, _TimerHandle())
         )
 
-    @classmethod
     def _register_callback(
-        cls,
+        self,
         loop: asyncio.AbstractEventLoop,
         callback: Callable[[], None],
         timeout: timedelta,
         handle: _TimerHandle,
     ) -> None:
+        # Wrap callback to track completion for watchdog
+        def wrapped_callback() -> None:
+            try:
+                # Signal watchdog that we're starting a handler
+                self._active_handlers.release()
+                
+                # Call the actual callback
+                callback()
+            finally:
+                # Signal watchdog that handler completed
+                self._completed_handlers.release()
+        
+        # Schedule the wrapped callback
         timer_handle = loop.call_later(
             timeout.total_seconds(),
-            callback,
+            wrapped_callback,
         )
         handle.set_timer_handle(timer_handle)
 
@@ -171,7 +253,7 @@ class _TimeoutManager:
         handle = _TimerHandle()
 
         loop.call_soon_threadsafe(
-            self._register_callback, loop, callback, timeout, handle
+            lambda: self._register_callback(loop, callback, timeout, handle)
         )
 
         yield
