@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 import socket
 import threading
 import time
@@ -131,7 +132,17 @@ class HTTPTransport(CheckpointTransport[T]):
                     self.send_error(500, str(e))
 
         server_address = ("", 0)
-        self._server = _IPv6HTTPServer(server_address, RequestHandler)
+        
+        # Use HTTP server factory to create appropriate server for our network environment 
+        from torchft.http import HTTPServerFactory
+        from torchft.network_utils import is_nebula_enabled
+        
+        self._server = HTTPServerFactory.create_server(
+            server_address, 
+            RequestHandler,
+            nebula_mode=is_nebula_enabled()
+        )
+        
         logger.info(f"Started CheckpointServer on {self.address()}...")
 
         self._thread = threading.Thread(
@@ -165,12 +176,27 @@ class HTTPTransport(CheckpointTransport[T]):
         Returns the HTTP address to fetch a checkpoint from this server. Step must be appended to the end of the address.
 
         Format: http://host:port/checkpoint/1234
-
+        
+        When using non-uniform networks (like Nebula or residential IPs), use environment variables:
+        - TORCHFT_EXTERNAL_IP: Manually specify external IP address
+        - TORCHFT_USE_NEBULA: Set to "1" to enable Nebula networking support
+        
         Returns:
             an HTTP address
         """
         port = self._server.socket.getsockname()[1]
-        return f"http://{socket.gethostname()}:{port}/checkpoint/"
+        
+        # Import here to avoid circular imports
+        from torchft.network_utils import get_external_ip, is_nebula_enabled
+        
+        # For non-uniform networks, use the external IP address
+        if is_nebula_enabled() or os.environ.get("TORCHFT_EXTERNAL_IP"):
+            hostname = get_external_ip()
+            logger.info(f"Using external IP for HTTP transport: {hostname}")
+        else:
+            hostname = socket.gethostname()
+            
+        return f"http://{hostname}:{port}/checkpoint/"
 
     def _serve(self) -> None:
         try:

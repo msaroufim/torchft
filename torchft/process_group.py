@@ -17,7 +17,9 @@ runtime users need to take care to not assume a static rank or world size.
 """
 
 import logging
+import os
 import threading
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -89,19 +91,42 @@ def create_store_client(store_addr: str, timeout: timedelta) -> Store:
     host:port/prefix
 
     Ex: localhost:1234/my/prefix
+    
+    For non-uniform networks like Nebula or residential IPs, you can set:
+    - TORCHFT_CONNECT_RETRY - number of retry attempts for connections (default: 5)
+    - TORCHFT_CONNECT_TIMEOUT - seconds to wait between retries (default: 3)
     """
     host, _, rest = store_addr.partition(":")
     port, _, prefix = rest.partition("/")
-
-    store = TCPStore(
-        host_name=host,
-        port=int(port),
-        is_master=False,
-        wait_for_workers=False,
-        timeout=timeout,
-    )
-    store = PrefixStore(prefix, store)
-    return store
+    
+    # Support connection retries for unreliable networks
+    retry_count = int(os.environ.get("TORCHFT_CONNECT_RETRY", "5"))
+    retry_timeout = float(os.environ.get("TORCHFT_CONNECT_TIMEOUT", "3.0"))
+    
+    # Try to connect with retries for non-uniform networks
+    last_error = None
+    for attempt in range(retry_count):
+        try:
+            store = TCPStore(
+                host_name=host,
+                port=int(port),
+                is_master=False,
+                wait_for_workers=False,
+                timeout=timeout,
+            )
+            store = PrefixStore(prefix, store)
+            return store
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Connection attempt {attempt+1}/{retry_count} failed: {e}")
+            if attempt < retry_count - 1:
+                time.sleep(retry_timeout)
+    
+    if last_error:
+        raise RuntimeError(f"Failed to connect to store after {retry_count} attempts: {last_error}")
+    
+    # Should never reach here, but just in case
+    raise RuntimeError(f"Failed to connect to store at {store_addr}")
 
 
 class ProcessGroup(BaseProcessGroup):

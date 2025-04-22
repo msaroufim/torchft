@@ -14,12 +14,48 @@ from torchft.process_group import (
     ProcessGroupNCCL,
 )
 
-__all__ = (
-    "DistributedDataParallel",
-    "DistributedSampler",
-    "Manager",
-    "Optimizer",
-    "ProcessGroupNCCL",
-    "ProcessGroupBabyNCCL",
-    "ProcessGroupGloo",
-)
+# Network utilities for non-uniform networks like Nebula
+try:
+    from torchft.network_utils import (
+        get_external_ip,
+        is_nebula_enabled,
+        get_nebula_interface,
+        get_nebula_ip,
+        get_nebula_lighthouse_ips,
+        check_nebula_status,
+        NetworkRetryHandler,
+        NebulaCoordinator,
+    )
+    
+    from torchft.http import StatusServer
+    
+    __all__ = (
+        "DistributedDataParallel",
+        "DistributedSampler",
+        "Manager",
+        "Optimizer",
+        "ProcessGroupNCCL",
+        "ProcessGroupBabyNCCL",
+        "ProcessGroupGloo",
+        # Network utilities
+        "get_external_ip",
+        "is_nebula_enabled",
+        "get_nebula_interface",
+        "get_nebula_ip",
+        "get_nebula_lighthouse_ips",
+        "check_nebula_status",
+        "NetworkRetryHandler",
+        "NebulaCoordinator",
+        "StatusServer",
+    )
+except ImportError:
+    # In case requests isn't installed
+    __all__ = (
+        "DistributedDataParallel",
+        "DistributedSampler",
+        "Manager",
+        "Optimizer",
+        "ProcessGroupNCCL",
+        "ProcessGroupBabyNCCL",
+        "ProcessGroupGloo",
+    )

@@ -1,0 +1,36 @@
+pki:
+  ca: /app/ca.crt
+  cert: /app/lighthouse.crt
+  key: /app/lighthouse.key
+
+lighthouse:
+  am_lighthouse: true
+  interval: 60s
+
+listen:
+  host: 0.0.0.0
+  port: 4242
+
+punchy:
+  punch: true
+
+tun:
+  dev: nebula1
+  drop_local_broadcast: false
+  drop_multicast: false
+  tx_queue: 500
+  mtu: 1300
+
+logging:
+  level: info
+  format: text
+
+firewall:
+  outbound:
+    - port: any
+      proto: any
+      host: any
+  inbound:
+    - port: any
+      proto: any
+      host: any
